@@ -495,7 +495,7 @@ async def test_onchain():
         print(f"\n📊 Network Stats:")
         stats = context.get('blockchain_stats', {})
         print(f"   Hashrate: {stats.get('hashrate', 0):.1f} EH/s")
-        print(f"   Difficulty: {stats.get('difficulty', 0):,.0f")
+        print(f"   Difficulty: {stats.get('difficulty', 0):,.0f}")
         
         print(f"\n🐋 Whale Activity:")
         whales = context['whale_alerts']
