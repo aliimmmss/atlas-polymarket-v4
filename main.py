@@ -15,8 +15,12 @@ if sys.platform == 'win32':
 
 import os
 import argparse
-from datetime import datetime, timezone
-from typing import Optional, Dict, Any
+import json
+import uuid
+import time
+from datetime import datetime, timezone, timedelta
+from typing import Optional, Dict, Any, List
+from dataclasses import dataclass, asdict
 import asyncio
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -28,7 +32,7 @@ from rich.panel import Panel
 
 # Import all modules
 from src.proxy.free_claude_proxy import FreeClaudeProxy
-from src.data.binance_feed import BitcoinPriceMonitor
+from src.data.binance_feed import BitcoinPriceMonitor, BinanceClient
 from src.data.derivatives_feed import DerivativesFeed
 from src.data.onchain_feed import OnChainFeed
 from src.data.price_aggregator import PriceAggregator
@@ -52,6 +56,129 @@ from src.backtest.attribution import PerformanceAttribution
 
 load_dotenv()
 console = Console()
+
+
+@dataclass
+class PredictionRecord:
+    """Complete prediction record for tracking and learning"""
+    prediction_id: str
+    timestamp: str
+    
+    # Market window info
+    market_slug: str
+    window_start: int
+    window_end: int
+    
+    # Price data at prediction time
+    start_price: float
+    ptb: Optional[float]  # Price to Beat
+    up_odds: Optional[float]
+    down_odds: Optional[float]
+    
+    # Prediction details
+    predicted_direction: str
+    predicted_probability: float
+    confidence: float
+    
+    # Agent predictions
+    agent_predictions: List[Dict]
+    
+    # Signal summary
+    regime: str
+    confluence: float
+    
+    # Outcome (filled after window closes)
+    end_price: Optional[float] = None
+    actual_direction: Optional[str] = None
+    actual_outcome: Optional[bool] = None  # True = UP won, False = DOWN won
+    price_change_percent: Optional[float] = None
+    brier_score: Optional[float] = None
+    correct: Optional[bool] = None
+    resolved_at: Optional[str] = None
+    
+    def to_dict(self) -> Dict:
+        return asdict(self)
+    
+    @classmethod
+    def from_dict(cls, data: Dict) -> "PredictionRecord":
+        return cls(**data)
+
+
+class PredictionHistory:
+    """Manages prediction history storage and retrieval"""
+    
+    def __init__(self, filepath: str = "data/prediction_history.json"):
+        self.filepath = filepath
+        self.predictions: List[PredictionRecord] = []
+        self._load()
+    
+    def _load(self):
+        """Load prediction history from file"""
+        if os.path.exists(self.filepath):
+            try:
+                with open(self.filepath, 'r') as f:
+                    data = json.load(f)
+                    self.predictions = [PredictionRecord.from_dict(p) for p in data.get('predictions', [])]
+            except Exception as e:
+                console.print(f"[yellow]Could not load prediction history: {e}[/]")
+                self.predictions = []
+    
+    def _save(self):
+        """Save prediction history to file"""
+        os.makedirs(os.path.dirname(self.filepath), exist_ok=True)
+        with open(self.filepath, 'w') as f:
+            json.dump({
+                "last_updated": datetime.now(timezone.utc).isoformat(),
+                "total_predictions": len(self.predictions),
+                "predictions": [p.to_dict() for p in self.predictions]
+            }, f, indent=2)
+    
+    def add_prediction(self, record: PredictionRecord):
+        """Add a new prediction record"""
+        self.predictions.append(record)
+        self._save()
+    
+    def update_outcome(self, prediction_id: str, outcome_data: Dict):
+        """Update a prediction with its outcome"""
+        for pred in self.predictions:
+            if pred.prediction_id == prediction_id:
+                pred.end_price = outcome_data.get('end_price')
+                pred.actual_direction = outcome_data.get('actual_direction')
+                pred.actual_outcome = outcome_data.get('actual_outcome')
+                pred.price_change_percent = outcome_data.get('price_change_percent')
+                pred.brier_score = outcome_data.get('brier_score')
+                pred.correct = outcome_data.get('correct')
+                pred.resolved_at = outcome_data.get('resolved_at')
+                break
+        self._save()
+    
+    def get_unresolved(self) -> List[PredictionRecord]:
+        """Get all predictions that haven't been resolved yet"""
+        return [p for p in self.predictions if p.resolved_at is None and p.window_end <= int(time.time())]
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Calculate performance statistics"""
+        resolved = [p for p in self.predictions if p.resolved_at is not None]
+        
+        if not resolved:
+            return {
+                "total_predictions": len(self.predictions),
+                "resolved": 0,
+                "pending": len(self.predictions)
+            }
+        
+        correct = sum(1 for p in resolved if p.correct)
+        total_brier = sum(p.brier_score for p in resolved if p.brier_score is not None)
+        
+        return {
+            "total_predictions": len(self.predictions),
+            "resolved": len(resolved),
+            "pending": len(self.predictions) - len(resolved),
+            "correct": correct,
+            "incorrect": len(resolved) - correct,
+            "win_rate": correct / len(resolved) if resolved else 0,
+            "average_brier": total_brier / len(resolved) if resolved else 0.25
+        }
 
 
 class AtlasV4:
@@ -100,6 +227,9 @@ class AtlasV4:
         self.current_market = None
         self.current_prediction = None
         self.running = False
+        
+        # Prediction history
+        self.prediction_history = PredictionHistory()
     
     async def gather_all_data(self) -> Dict[str, Any]:
         """Gather data from all sources"""
@@ -287,8 +417,6 @@ class AtlasV4:
     def display_prediction(self, prediction: Dict[str, Any]):
         """Display prediction with rich formatting"""
         
-        from datetime import timezone
-        
         final = prediction["final"]
         direction = final["direction"]
         
@@ -313,7 +441,8 @@ class AtlasV4:
         down_odds = self.current_market.down_price if self.current_market else None
         
         # Main prediction panel
-        panel_content = f"""\n[bold white]━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[/]
+        panel_content = f"""
+[bold white]━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[/]
 [bold cyan]Prediction Time:[/] {pred_time}
 [bold cyan]Market:[/] {market_slug}
 [bold white]━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[/]
@@ -540,10 +669,151 @@ def display_market_info(market=None, current_price: float = None):
     ))
 
 
+def display_performance_stats(history: PredictionHistory):
+    """Display performance statistics"""
+    stats = history.get_stats()
+    
+    if stats["resolved"] == 0:
+        return
+    
+    console.print("\n" + "═" * 60)
+    console.print("[bold cyan]📊 Performance Statistics[/]")
+    console.print("═" * 60)
+    
+    perf_table = Table(show_header=True)
+    perf_table.add_column("Metric", style="cyan", width=25)
+    perf_table.add_column("Value", style="white", width=20)
+    
+    perf_table.add_row("Total Predictions", str(stats["total_predictions"]))
+    perf_table.add_row("Resolved", str(stats["resolved"]))
+    perf_table.add_row("Pending", str(stats["pending"]))
+    
+    if stats["resolved"] > 0:
+        win_color = "green" if stats["win_rate"] > 0.55 else "red" if stats["win_rate"] < 0.50 else "yellow"
+        perf_table.add_row("Win Rate", f"[{win_color}]{stats['win_rate']:.1%}[/{win_color}]")
+        perf_table.add_row("Correct", f"[green]{stats['correct']}[/]")
+        perf_table.add_row("Incorrect", f"[red]{stats['incorrect']}[/]")
+        
+        brier_color = "green" if stats["average_brier"] < 0.20 else "red" if stats["average_brier"] > 0.25 else "yellow"
+        perf_table.add_row("Avg Brier Score", f"[{brier_color}]{stats['average_brier']:.4f}[/{brier_color}]")
+    
+    console.print(perf_table)
+
+
+def display_outcome_result(record: PredictionRecord):
+    """Display the outcome of a resolved prediction"""
+    result_color = "green" if record.correct else "red"
+    result_emoji = "✅" if record.correct else "❌"
+    
+    console.print(f"\n[result_color]{'═' * 60}[/]")
+    console.print(f"[bold {result_color}]{result_emoji} MARKET RESOLVED - {'CORRECT!' if record.correct else 'INCORRECT'}[/]")
+    console.print(f"[{result_color}]{'═' * 60}[/]")
+    
+    outcome_table = Table(show_header=False)
+    outcome_table.add_column("Key", style="cyan", width=25)
+    outcome_table.add_column("Value", style="white")
+    
+    outcome_table.add_row("Market", record.market_slug)
+    outcome_table.add_row("Predicted", f"[bold]{record.predicted_direction}[/] ({record.predicted_probability:.0%})")
+    outcome_table.add_row("Actual", f"[bold {result_color}]{record.actual_direction}[/]")
+    outcome_table.add_row("Start Price", f"${record.start_price:,.2f}")
+    outcome_table.add_row("End Price", f"${record.end_price:,.2f}")
+    outcome_table.add_row("Price Change", f"{record.price_change_percent:+.3f}%")
+    
+    if record.ptb:
+        outcome_table.add_row("Price to Beat", f"${record.ptb:,.2f}")
+    
+    outcome_table.add_row("Brier Score", f"{record.brier_score:.4f}")
+    
+    console.print(outcome_table)
+
+
+async def resolve_prediction(atlas: AtlasV4, record: PredictionRecord) -> bool:
+    """
+    Resolve a prediction by fetching the final price and determining outcome.
+    
+    Returns True if resolution was successful.
+    """
+    try:
+        console.print(f"\n[cyan]🔄 Resolving prediction {record.prediction_id[:8]}...[/]")
+        
+        # Fetch current price (which is now the end price since window closed)
+        async with BinanceClient() as client:
+            end_price = await client.get_current_price()
+        
+        # Determine actual outcome
+        price_change_percent = ((end_price - record.start_price) / record.start_price) * 100
+        
+        # Determine actual direction based on PTB or price change
+        if record.ptb:
+            # If we have PTB, use it to determine outcome
+            # UP wins if end_price >= PTB, DOWN wins if end_price < PTB
+            actual_outcome = end_price >= record.ptb  # True = UP won
+            actual_direction = "UP" if actual_outcome else "DOWN"
+        else:
+            # Fallback to price change direction
+            actual_direction = "UP" if end_price >= record.start_price else "DOWN"
+            actual_outcome = actual_direction == "UP"
+        
+        # Determine if prediction was correct
+        # The prediction was correct if the predicted direction matches actual
+        if record.predicted_direction == "UP":
+            correct = actual_outcome  # UP won
+        elif record.predicted_direction == "DOWN":
+            correct = not actual_outcome  # DOWN won
+        else:
+            correct = False  # NEUTRAL predictions are never "correct"
+        
+        # Calculate Brier score
+        # For UP prediction: (predicted_prob - 1)^2 if UP won, (predicted_prob - 0)^2 if DOWN won
+        if actual_outcome:  # UP won
+            brier_score = (record.predicted_probability - 1.0) ** 2
+        else:  # DOWN won
+            brier_score = (record.predicted_probability - 0.0) ** 2
+        
+        # Update the record
+        outcome_data = {
+            "end_price": end_price,
+            "actual_direction": actual_direction,
+            "actual_outcome": actual_outcome,
+            "price_change_percent": price_change_percent,
+            "brier_score": brier_score,
+            "correct": correct,
+            "resolved_at": datetime.now(timezone.utc).isoformat()
+        }
+        
+        atlas.prediction_history.update_outcome(record.prediction_id, outcome_data)
+        
+        # Record outcome in agent team for learning
+        atlas.agent_team.record_outcome(
+            prediction_id=record.prediction_id,
+            actual_outcome=actual_outcome,
+            actual_price_change=price_change_percent
+        )
+        
+        # Update the record for display
+        record.end_price = end_price
+        record.actual_direction = actual_direction
+        record.actual_outcome = actual_outcome
+        record.price_change_percent = price_change_percent
+        record.brier_score = brier_score
+        record.correct = correct
+        record.resolved_at = outcome_data["resolved_at"]
+        
+        # Display result
+        display_outcome_result(record)
+        
+        return True
+        
+    except Exception as e:
+        console.print(f"[red]Error resolving prediction: {e}[/]")
+        return False
+
+
 async def run_paper_mode(max_predictions: int = None):
-    """Run paper trading mode"""
+    """Run paper trading mode with full outcome tracking and learning"""
     console.print("\n[bold cyan]═══════════════════════════════════════════════════════════════[/]")
-    console.print("[bold]  ATLAS v4.0 - Paper Trading Mode[/]")
+    console.print("[bold]  ATLAS v4.0 - Paper Trading Mode with Learning[/]")
     console.print("[bold cyan]═══════════════════════════════════════════════════════════════[/]\n")
     
     # Initialize
@@ -557,17 +827,44 @@ async def run_paper_mode(max_predictions: int = None):
     
     atlas = AtlasV4(llm_client=llm_client)
     
+    # Load previous state
     if atlas.agent_team.load_state("data/agent_state.json"):
         stats = atlas.agent_team.get_stats()
         console.print(f"[green]✓ Loaded previous learning ({stats['total_predictions']} predictions)[/]")
     
+    # Display existing performance stats
+    display_performance_stats(atlas.prediction_history)
+    
     atlas.running = True
     prediction_count = 0
+    
+    # Queue for pending resolutions
+    pending_resolutions: List[PredictionRecord] = []
     
     while atlas.running:
         if max_predictions and prediction_count >= max_predictions:
             console.print(f"\n[yellow]Reached max predictions ({max_predictions}). Stopping.[/]")
             break
+        
+        # Check for any predictions that need resolution
+        unresolved = atlas.prediction_history.get_unresolved()
+        for record in unresolved:
+            if record not in pending_resolutions:
+                pending_resolutions.append(record)
+        
+        # Resolve any pending predictions whose windows have closed
+        resolved_this_round = []
+        for record in pending_resolutions:
+            if record.window_end <= int(time.time()):
+                success = await resolve_prediction(atlas, record)
+                if success:
+                    resolved_this_round.append(record)
+                    # Save state after each resolution
+                    atlas.save_state()
+        
+        # Remove resolved from pending
+        for record in resolved_this_round:
+            pending_resolutions.remove(record)
         
         # Display market info
         display_market_info()
@@ -575,6 +872,9 @@ async def run_paper_mode(max_predictions: int = None):
         # Wait for next market window
         seconds_until = PolymarketSync.seconds_until_next_market()
         console.print(f"\n[cyan]⏳ Next market window in {format_countdown(seconds_until)}[/]")
+        
+        if pending_resolutions:
+            console.print(f"[yellow]📋 {len(pending_resolutions)} prediction(s) pending resolution[/]")
         
         await asyncio.sleep(seconds_until)
         
@@ -590,16 +890,72 @@ async def run_paper_mode(max_predictions: int = None):
         # Make prediction
         prediction = await atlas.make_prediction()
         
-        # Display market info with current price
+        # Get market window times
+        window_start, window_end = PolymarketSync.get_current_market_times()
+        
+        # Create prediction record
         current_price = prediction.get("signals", {}).get("current_price", 0)
+        
+        record = PredictionRecord(
+            prediction_id=str(uuid.uuid4())[:8],
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            market_slug=PolymarketSync.get_market_slug(),
+            window_start=window_start,
+            window_end=window_end,
+            start_price=current_price,
+            ptb=market.ptb if market else None,
+            up_odds=market.up_price if market else None,
+            down_odds=market.down_price if market else None,
+            predicted_direction=prediction["final"]["direction"],
+            predicted_probability=prediction["final"]["probability"],
+            confidence=prediction["final"]["confidence"],
+            agent_predictions=prediction["agent_predictions"],
+            regime=prediction.get("regime", "Unknown"),
+            confluence=prediction.get("confluence", 0)
+        )
+        
+        # Store prediction in history
+        atlas.prediction_history.add_prediction(record)
+        
+        # Add prediction to agent team's history for later resolution
+        atlas.agent_team.prediction_history.append({
+            "prediction_id": record.prediction_id,
+            "timestamp": record.timestamp,
+            "final": prediction["final"],
+            "agent_predictions": prediction["agent_predictions"]
+        })
+        
+        # Display market info with current price
         display_market_info(market, current_price)
         
         # Display prediction
         atlas.display_prediction(prediction)
         
+        # Add to pending resolutions
+        pending_resolutions.append(record)
+        
+        console.print(f"\n[cyan]📝 Prediction saved with ID: {record.prediction_id}[/]")
+        console.print(f"[cyan]⏰ Will resolve after window closes at {format_timestamp(window_end)}[/]")
+        
+        # Save state
+        atlas.save_state()
+        
         prediction_count += 1
+        
+        # Display updated stats
+        display_performance_stats(atlas.prediction_history)
     
+    # Final resolution of any remaining predictions
+    console.print("\n[yellow]Resolving remaining predictions...[/]")
+    for record in pending_resolutions:
+        if record.resolved_at is None:
+            await resolve_prediction(atlas, record)
+    
+    # Final save
     atlas.save_state()
+    
+    # Display final stats
+    display_performance_stats(atlas.prediction_history)
 
 
 async def run_backtest(start_date: str, end_date: str):
@@ -699,8 +1055,24 @@ def show_status():
             weights_table.add_row(name, f"{weight:.2f}", f"{win_rate:.0%}")
         
         console.print(weights_table)
+    
+    # Load prediction history
+    history = PredictionHistory()
+    hist_stats = history.get_stats()
+    
+    if hist_stats["resolved"] > 0:
+        hist_table = Table(title="📋 Prediction History")
+        hist_table.add_column("Metric", style="cyan")
+        hist_table.add_column("Value", style="yellow")
+        
+        hist_table.add_row("Total Predictions", str(hist_stats["total_predictions"]))
+        hist_table.add_row("Resolved", str(hist_stats["resolved"]))
+        hist_table.add_row("Win Rate", f"{hist_stats['win_rate']:.1%}")
+        hist_table.add_row("Avg Brier Score", f"{hist_stats['average_brier']:.4f}")
+        
+        console.print(hist_table)
     else:
-        console.print("[yellow]No previous state found[/]")
+        console.print("[yellow]No resolved predictions yet[/]")
 
 
 def main():
