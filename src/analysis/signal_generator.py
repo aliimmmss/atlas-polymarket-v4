@@ -155,10 +155,7 @@ class SignalGenerator:
         
         # ATR (volatility)
         if len(highs) > 14:
-            atr = self.tech.atr(
-                [{"high": h, "low": l, "close": c} for h, l, c in zip(highs, lows, closes)],
-                14
-            )
+            atr = self.tech.atr(highs, lows, closes, 14)
             signals["atr"] = {
                 "value": atr,
                 "percent": (atr / closes[-1]) * 100 if closes[-1] > 0 else 0
