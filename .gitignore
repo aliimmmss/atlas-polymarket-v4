@@ -38,8 +38,8 @@ env/
 .env.local
 .env.*.local
 
-# Data and logs
-data/
+# Data and logs (only root data folder, not src/data)
+/data/
 logs/
 *.json
 *.db
