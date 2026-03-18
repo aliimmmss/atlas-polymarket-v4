@@ -15,7 +15,7 @@ if sys.platform == 'win32':
 
 import os
 import argparse
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, Dict, Any
 import asyncio
 
@@ -287,8 +287,14 @@ class AtlasV4:
     def display_prediction(self, prediction: Dict[str, Any]):
         """Display prediction with rich formatting"""
         
+        from datetime import timezone
+        
         final = prediction["final"]
         direction = final["direction"]
+        
+        # Get timestamp
+        pred_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        market_slug = PolymarketSync.get_market_slug()
         
         if direction == "UP":
             emoji, color = "📈", "green"
@@ -297,8 +303,21 @@ class AtlasV4:
         else:
             emoji, color = "➡️", "yellow"
         
+        # Current price info
+        current_price = prediction.get("signals", {}).get("current_price", 0)
+        price_change = prediction.get("signals", {}).get("price_change_24h", 0)
+        
+        # Market info
+        ptb = self.current_market.ptb if self.current_market else None
+        up_odds = self.current_market.up_price if self.current_market else None
+        down_odds = self.current_market.down_price if self.current_market else None
+        
         # Main prediction panel
-        panel_content = f"""
+        panel_content = f"""\n[bold white]━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[/]
+[bold cyan]Prediction Time:[/] {pred_time}
+[bold cyan]Market:[/] {market_slug}
+[bold white]━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[/]
+
 {emoji} [bold]PREDICTION: [{color}]{direction}[/{color}][/]
 
 [bold cyan]Probability:[/] {final['probability']:.1%} UP | {(1-final['probability']):.1%} DOWN
@@ -313,17 +332,50 @@ class AtlasV4:
 [bold]Should Trade:[/] {'✓ Yes' if final.get('should_trade', True) else '✗ No'}
 """
         
+        # Add current price info
+        if current_price:
+            price_color = "green" if price_change >= 0 else "red"
+            panel_content += f"""
+[bold white]━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[/]
+[bold cyan]Current BTC Price:[/] ${current_price:,.2f} [{price_color}]({price_change:+.2f}% 24h)[/{price_color}]
+"""
+        
+        # Add PTB info
+        if ptb:
+            panel_content += f"""
+[bold magenta]Price to Beat:[/] ${ptb:,.2f}
+"""
+            if current_price:
+                diff = current_price - ptb
+                diff_pct = (diff / ptb) * 100
+                diff_color = "green" if diff >= 0 else "red"
+                direction_hint = "↑ ABOVE" if diff >= 0 else "↓ BELOW"
+                panel_content += f"""
+[bold]Position vs PTB:[/] [{diff_color}]{direction_hint} PTB by {abs(diff_pct):.3f} ({diff:+,.2f})[/{diff_color}]
+"""
+        
+        # Add market odds
+        if up_odds and down_odds:
+            panel_content += f"""
+[bold white]━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[/]
+[bold cyan]Polymarket Odds:[/] UP [green]{up_odds:.1%}[/] | DOWN [red]{down_odds:.1%}[/]
+"""
+        
         if "ev" in prediction:
             ev = prediction["ev"]
+            ev_color = "green" if ev['expected_value'] > 0 else "red"
             panel_content += f"""
-[bold green]Expected Value:[/] {ev['expected_value']:.2%}
-[bold green]Edge:[/] {ev['edge']:.2%}
+[bold white]━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[/]
+[bold green]Expected Value:[/] [{ev_color}]{ev['expected_value']:.2%}[/{ev_color}]
+[bold green]Edge vs Market:[/] [{ev_color}]{ev['edge']:.2%}[/{ev_color}]
+[bold green]Recommendation:[/] {ev['recommendation']}
 """
         
         if "position_size" in prediction:
             ps = prediction["position_size"]
             panel_content += f"""
-[bold magenta]Position Size:[/] ${ps['size']:.2f} ({ps['size_percent']:.1f}%)
+[bold magenta]Kelly Position Size:[/] ${ps['size']:.2f} ({ps['size_percent']:.1f}%)
+[bold magenta]Kelly Fraction:[/] {ps['kelly_fraction']:.2f}
 """
         
         console.print(Panel(
@@ -338,17 +390,59 @@ class AtlasV4:
         table.add_column("Vote", width=8)
         table.add_column("Prob", width=8)
         table.add_column("Weight", width=8)
+        table.add_column("Confidence", width=10)
         
         for ap in prediction["agent_predictions"][:10]:
             vote_color = "green" if ap["direction"] == "UP" else "red" if ap["direction"] == "DOWN" else "white"
+            confidence = ap.get("confidence", 0.5)
             table.add_row(
                 ap["agent_name"],
                 f"[{vote_color}]{ap['direction']}[/]",
                 f"{ap['probability']:.0%}",
-                f"{ap['weight']:.2f}"
+                f"{ap['weight']:.2f}",
+                f"{confidence:.0%}"
             )
         
         console.print(table)
+        
+        # Technical signals summary
+        tech_signals = prediction.get("signals", {}).get("technical", {})
+        if tech_signals:
+            tech_table = Table(title="📊 Technical Signals", show_header=True)
+            tech_table.add_column("Indicator", style="cyan", width=15)
+            tech_table.add_column("Value", width=12)
+            tech_table.add_column("Signal", width=12)
+            
+            indicators = ["rsi", "macd", "bollinger", "stochastic", "momentum", "atr"]
+            for ind in indicators:
+                if ind in tech_signals:
+                    data = tech_signals[ind]
+                    if isinstance(data, dict):
+                        if ind == "rsi":
+                            val = f"{data.get('value', 0):.1f}"
+                            sig = data.get("signal", "neutral")
+                        elif ind == "macd":
+                            val = f"{data.get('macd', 0):.2f}"
+                            sig = data.get("trend", "neutral")
+                        elif ind == "bollinger":
+                            val = f"{data.get('position', 0):.1%}"
+                            sig = data.get("signal", "neutral")
+                        elif ind == "stochastic":
+                            val = f"K:{data.get('k', 50):.1f}"
+                            sig = data.get("signal", "neutral")
+                        elif ind == "momentum":
+                            val = f"{data.get('value', 0):.2f}%"
+                            sig = data.get("signal", "neutral")
+                        elif ind == "atr":
+                            val = f"{data.get('percent', 0):.2f}%"
+                            sig = "volatility"
+                        else:
+                            continue
+                        
+                        sig_color = "green" if sig in ["bullish", "oversold", "up", "weak_bullish"] else "red" if sig in ["bearish", "overbought", "down", "weak_bearish"] else "yellow"
+                        tech_table.add_row(ind.upper(), val, f"[{sig_color}]{sig}[/]")
+            
+            console.print(tech_table)
     
     def save_state(self):
         """Save system state"""
@@ -389,6 +483,63 @@ async def run_single_prediction():
     atlas.save_state()
 
 
+def display_market_info(market=None, current_price: float = None):
+    """Display market window information"""
+    now = datetime.now()
+    now_utc = datetime.now(timezone.utc)
+    
+    # Get market times
+    next_start, next_end = PolymarketSync.get_next_market_times()
+    current_start, current_end = PolymarketSync.get_current_market_times()
+    
+    # Create info table
+    info_table = Table(show_header=False, box=None, expand=True)
+    info_table.add_column("Key", style="cyan", width=20)
+    info_table.add_column("Value", style="white")
+    
+    # Time info
+    info_table.add_row("🕐 Local Time", now.strftime("%Y-%m-%d %H:%M:%S"))
+    info_table.add_row("🌐 UTC Time", now_utc.strftime("%Y-%m-%d %H:%M:%S"))
+    info_table.add_row("", "")
+    
+    # Current market window
+    info_table.add_row("[bold]CURRENT WINDOW[/]", "")
+    info_table.add_row("  Market Slug", f"[yellow]{PolymarketSync.get_market_slug()}[/]")
+    info_table.add_row("  Window Start", format_timestamp(current_start))
+    info_table.add_row("  Window End", format_timestamp(current_end))
+    
+    remaining = PolymarketSync.seconds_remaining_in_current()
+    info_table.add_row("  Time Remaining", f"[red]{format_countdown(remaining)}[/]")
+    
+    info_table.add_row("", "")
+    
+    # Next market window
+    info_table.add_row("[bold]NEXT WINDOW[/]", "")
+    info_table.add_row("  Market Slug", f"[yellow]{PolymarketSync.get_next_market_slug()}[/]")
+    info_table.add_row("  Starts At", format_timestamp(next_start))
+    info_table.add_row("  Starts In", f"[green]{format_countdown(PolymarketSync.seconds_until_next_market())}[/]")
+    
+    if market and market.ptb:
+        info_table.add_row("", "")
+        info_table.add_row("[bold]MARKET DATA[/]", "")
+        info_table.add_row("  Price to Beat", f"[magenta]${market.ptb:,.2f}[/]")
+        if current_price:
+            diff = current_price - market.ptb
+            diff_pct = (diff / market.ptb) * 100
+            diff_color = "green" if diff >= 0 else "red"
+            info_table.add_row("  Current Price", f"[${current_price:,.2f}] [{diff_color}]({diff_pct:+.3f}%)[/{diff_color}]")
+        
+        if market.up_price and market.down_price:
+            info_table.add_row("  UP Odds", f"[green]{market.up_price:.2%}[/]")
+            info_table.add_row("  DOWN Odds", f"[red]{market.down_price:.2%}[/]")
+    
+    console.print(Panel(
+        info_table,
+        title="[bold]📊 Market Window Info[/]",
+        border_style="blue"
+    ))
+
+
 async def run_paper_mode(max_predictions: int = None):
     """Run paper trading mode"""
     console.print("\n[bold cyan]═══════════════════════════════════════════════════════════════[/]")
@@ -398,6 +549,7 @@ async def run_paper_mode(max_predictions: int = None):
     # Initialize
     try:
         llm_client = FreeClaudeProxy()
+        console.print("[green]✓ NVIDIA NIM API connected[/]")
         console.print("[green]✓ LLM Provider connected[/]")
     except Exception as e:
         console.print(f"[yellow]⚠ LLM unavailable: {e}[/]")
@@ -406,7 +558,8 @@ async def run_paper_mode(max_predictions: int = None):
     atlas = AtlasV4(llm_client=llm_client)
     
     if atlas.agent_team.load_state("data/agent_state.json"):
-        console.print("[green]✓ Loaded previous learning[/]")
+        stats = atlas.agent_team.get_stats()
+        console.print(f"[green]✓ Loaded previous learning ({stats['total_predictions']} predictions)[/]")
     
     atlas.running = True
     prediction_count = 0
@@ -416,14 +569,32 @@ async def run_paper_mode(max_predictions: int = None):
             console.print(f"\n[yellow]Reached max predictions ({max_predictions}). Stopping.[/]")
             break
         
+        # Display market info
+        display_market_info()
+        
         # Wait for next market window
         seconds_until = PolymarketSync.seconds_until_next_market()
         console.print(f"\n[cyan]⏳ Next market window in {format_countdown(seconds_until)}[/]")
         
         await asyncio.sleep(seconds_until)
         
+        # Get current market with PTB
+        console.print("\n[bold green]🚀 Market Window Open! Fetching data...[/]")
+        try:
+            market = atlas.polymarket.get_current_market(fetch_ptb=True)
+            atlas.current_market = market
+        except Exception as e:
+            console.print(f"[yellow]⚠ Could not fetch market: {e}[/]")
+            market = None
+        
         # Make prediction
         prediction = await atlas.make_prediction()
+        
+        # Display market info with current price
+        current_price = prediction.get("signals", {}).get("current_price", 0)
+        display_market_info(market, current_price)
+        
+        # Display prediction
         atlas.display_prediction(prediction)
         
         prediction_count += 1
