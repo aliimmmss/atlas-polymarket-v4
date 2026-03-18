@@ -9,7 +9,7 @@ from datetime import datetime
 
 
 @dataclass
-class EVResult:
+class ExpectedValueResult:
     """Expected value calculation result"""
     expected_value: float
     expected_return: float
@@ -18,6 +18,10 @@ class EVResult:
     is_positive_ev: bool
     recommendation: str
     details: Dict[str, Any]
+
+
+# Alias for backwards compatibility
+EVResult = ExpectedValueResult
 
 
 class ExpectedValueCalculator:
