@@ -224,20 +224,39 @@ class Agent:
         """
         Update Darwinian weight based on recent performance.
         Good performers get louder, bad performers get quieter.
+        
+        FIXED: Now uses absolute performance AND improvement trend.
+        - Agents with LOW Brier scores (good) get increased weight
+        - Agents with HIGH Brier scores (bad) get decreased weight
+        - Bonus for improving performance
         """
         if self.performance.total_predictions < 3:
             return  # Not enough data
         
         recent_brier = self.performance.recent_average_brier
         overall_brier = self.performance.average_brier_score
+        win_rate = self.performance.win_rate
         
-        # Lower Brier = better performance
-        if recent_brier < overall_brier:
-            # Improving - increase weight
-            self.weight = min(self.weight * (1 + alpha), self.max_weight)
+        # Base adjustment on absolute performance (Brier score)
+        # Lower Brier = better, 0.25 = random guessing
+        brier_threshold = 0.22  # Good performance threshold
+        
+        if overall_brier < brier_threshold:
+            # Good performer - increase weight based on how good
+            performance_bonus = (brier_threshold - overall_brier) / brier_threshold
+            adjustment = alpha * (1 + performance_bonus)
+            self.weight = min(self.weight * (1 + adjustment), self.max_weight)
         else:
-            # Worsening - decrease weight
-            self.weight = max(self.weight * (1 - alpha * 0.5), self.min_weight)
+            # Poor performer - decrease weight based on how bad
+            performance_penalty = (overall_brier - brier_threshold) / brier_threshold
+            adjustment = alpha * (1 + min(performance_penalty, 1.0))
+            self.weight = max(self.weight * (1 - adjustment), self.min_weight)
+        
+        # Additional bonus/penalty for trend
+        if recent_brier < overall_brier * 0.95:  # Improving (>5% better recent)
+            self.weight = min(self.weight * 1.05, self.max_weight)
+        elif recent_brier > overall_brier * 1.05:  # Worsening (>5% worse recent)
+            self.weight = max(self.weight * 0.95, self.min_weight)
     
     def record_result(self, predicted_prob: float, actual_outcome: bool, direction: str):
         """Record a prediction result"""
@@ -362,12 +381,12 @@ class AgentTeam:
     DEFAULT_AGENT_CONFIGS = [
         {"id": "rsi_master", "name": "RSI Master", "focus": "RSI and overbought/oversold conditions", "regime": "ALL"},
         {"id": "macd_trend", "name": "MACD Trend", "focus": "MACD crossovers and trend direction", "regime": "ALL"},
-        {"id": "momentum_hawk", "name": "Momentum Hawk", "focus": "Price momentum and velocity", "regime": "TRENDING_UP"},
-        {"id": "volume_whale", "name": "Volume Whale", "focus": "Volume patterns and whale activity", "regime": "BREAKOUT"},
-        {"id": "support_resist", "name": "Support/Resistance", "focus": "Key price levels and breakouts", "regime": "RANGING"},
+        {"id": "momentum_hawk", "name": "Momentum Hawk", "focus": "Price momentum and velocity", "regime": "TRENDING"},
+        {"id": "volume_whale", "name": "Volume Whale", "focus": "Volume patterns and whale activity", "regime": "ALL"},
+        {"id": "support_resist", "name": "Support/Resistance", "focus": "Key price levels and breakouts", "regime": "ALL"},
         {"id": "order_flow", "name": "Order Flow", "focus": "Buy/sell pressure and order book", "regime": "ALL"},
-        {"id": "volatility", "name": "Volatility Watcher", "focus": "Volatility and price swings", "regime": "VOLATILE"},
-        {"id": "sentiment", "name": "Sentiment Reader", "focus": "Market sentiment and positioning", "regime": "REVERSAL"},
+        {"id": "volatility", "name": "Volatility Watcher", "focus": "Volatility and price swings", "regime": "ALL"},
+        {"id": "sentiment", "name": "Sentiment Reader", "focus": "Market sentiment and positioning", "regime": "ALL"},
     ]
     
     def __init__(self, llm_client=None, agent_configs: List[Dict] = None):
@@ -391,6 +410,13 @@ class AgentTeam:
             system_prompt=f"""You are an expert Bitcoin analyst specializing in {focus}.
 Your role is to analyze market data and predict Bitcoin's price movement over the next 15 minutes.
 Be objective, data-driven, and concise. Focus on {focus} signals.
+
+IMPORTANT: You must be EQUALLY willing to predict UP or DOWN based on the data.
+- Do NOT have a bullish bias
+- Do NOT have a bearish bias  
+- Let the data dictate the direction
+- If signals are mixed or weak, predict NEUTRAL with 50% probability
+
 Avoid emotional decisions. Stick to what the data shows.""",
             
             analysis_template=f"""Analyze the following Bitcoin market data focusing on {focus}:
@@ -408,10 +434,12 @@ Volume Ratio: {{volume_ratio:.2f}}x
 
 Focus on {focus} and provide your 15-minute prediction.
 
-DIRECTION: UP/DOWN
+CRITICAL: Be balanced. Predict UP only if clear bullish signals exist. Predict DOWN only if clear bearish signals exist.
+
+DIRECTION: UP/DOWN/NEUTRAL
 PROBABILITY: XX%
 CONFIDENCE: High/Medium/Low
-REASONING: [1-2 sentences]"""
+REASONING: [1-2 sentences explaining the KEY factor]"""
         )
         
         return Agent(
@@ -426,18 +454,10 @@ REASONING: [1-2 sentences]"""
     async def predict(self, market_context: Dict[str, Any], current_regime: str = None) -> Dict[str, Any]:
         """
         Generate collective prediction from all agents.
-        Optionally filter by regime.
+        FIXED: All agents now participate, but regime-matching agents get weight bonus.
         """
-        # Select agents based on regime
-        if current_regime:
-            active_agents = [
-                a for a in self.agents 
-                if a.regime == "ALL" or a.regime.upper() == current_regime.upper()
-            ]
-            if not active_agents:
-                active_agents = self.agents
-        else:
-            active_agents = self.agents
+        # All agents participate now (no filtering)
+        active_agents = self.agents
         
         # Get predictions from all agents in parallel
         tasks = [agent.analyze(market_context) for agent in active_agents]
@@ -446,11 +466,20 @@ REASONING: [1-2 sentences]"""
         # Collect predictions
         agent_predictions = []
         for agent, result in zip(active_agents, results):
+            # Calculate effective weight with regime bonus
+            effective_weight = agent.weight
+            
+            # Regime-matching agents get a weight bonus
+            if current_regime and agent.regime != "ALL":
+                if agent.regime.upper() in (current_regime or "").upper():
+                    effective_weight *= 1.5  # 50% bonus for regime match
+            
             agent_predictions.append({
                 "agent_id": agent.agent_id,
                 "agent_name": agent.name,
                 "focus": agent.focus,
-                "weight": agent.weight,
+                "weight": effective_weight,
+                "base_weight": agent.weight,
                 "regime": agent.regime,
                 "direction": result["direction"],
                 "probability": result["probability"],
@@ -470,7 +499,10 @@ REASONING: [1-2 sentences]"""
         }
     
     def _aggregate_predictions(self, predictions: List[Dict]) -> Dict[str, Any]:
-        """Aggregate predictions using weighted voting"""
+        """Aggregate predictions using weighted voting
+        
+        FIXED: Widened thresholds and improved confidence calculation
+        """
         
         # Calculate weighted probabilities for UP
         total_weight = 0
@@ -499,10 +531,10 @@ REASONING: [1-2 sentences]"""
         
         final_prob = weighted_up_prob / total_weight if total_weight > 0 else 0.5
         
-        # Determine direction
-        if final_prob > 0.53:
+        # WIDENED thresholds: 0.50 for direction decision (was 0.53/0.47)
+        if final_prob > 0.50:
             direction = "UP"
-        elif final_prob < 0.47:
+        elif final_prob < 0.50:
             direction = "DOWN"
         else:
             direction = "NEUTRAL"
@@ -510,12 +542,24 @@ REASONING: [1-2 sentences]"""
         # Calculate agreement
         up_votes = sum(1 for p in predictions if p["direction"] == "UP")
         down_votes = sum(1 for p in predictions if p["direction"] == "DOWN")
-        total_votes = up_votes + down_votes
+        neutral_votes = sum(1 for p in predictions if p["direction"] == "NEUTRAL")
+        total_votes = up_votes + down_votes + neutral_votes
         
         agreement = max(up_votes, down_votes) / total_votes if total_votes > 0 else 0.5
         
-        # Calculate confidence
-        confidence = agreement * (0.5 + 0.5 * abs(final_prob - 0.5) * 2)
+        # IMPROVED confidence calculation
+        # Base confidence on distance from 50%
+        distance_confidence = abs(final_prob - 0.5) * 2  # 0 to 1
+        
+        # Adjust by agreement level
+        agreement_confidence = agreement
+        
+        # Combined confidence (weighted average)
+        confidence = 0.6 * distance_confidence + 0.4 * agreement_confidence
+        
+        # Boost confidence when most agents agree
+        if agreement > 0.7:
+            confidence = min(confidence * 1.2, 1.0)
         
         return {
             "direction": direction,
@@ -524,6 +568,7 @@ REASONING: [1-2 sentences]"""
             "agreement": agreement,
             "up_votes": up_votes,
             "down_votes": down_votes,
+            "neutral_votes": neutral_votes,
             "total_weight": total_weight
         }
     
