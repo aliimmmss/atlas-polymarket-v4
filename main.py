@@ -29,6 +29,7 @@ from dotenv import load_dotenv
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
+from rich.progress import Progress, SpinnerColumn, TextColumn
 
 # Import all modules
 from src.proxy.free_claude_proxy import FreeClaudeProxy
@@ -58,6 +59,153 @@ load_dotenv()
 console = Console()
 
 
+# ============================================================================
+# PAPER TRADING TRACKER
+# ============================================================================
+
+@dataclass
+class PaperTrade:
+    """A paper trade record"""
+    trade_id: str
+    timestamp: str
+    direction: str  # UP or DOWN
+    entry_price: float  # Price at trade entry
+    market_odds: float  # Odds at entry
+    stake: float  # Amount staked (paper)
+    prediction_id: str
+    confidence: float
+    # Outcome
+    exit_price: Optional[float] = None
+    outcome: Optional[str] = None  # WIN or LOSS
+    pnl: Optional[float] = None  # Profit/Loss
+    resolved_at: Optional[str] = None
+
+
+class PaperTradingAccount:
+    """
+    Paper trading account to track balance and trades.
+    This is what was missing - the system predicts but doesn't track trades!
+    """
+    
+    def __init__(self, initial_balance: float = 1000.0, filepath: str = "data/paper_account.json"):
+        self.initial_balance = initial_balance
+        self.balance = initial_balance
+        self.filepath = filepath
+        self.trades: List[PaperTrade] = []
+        self.total_trades = 0
+        self.winning_trades = 0
+        self.losing_trades = 0
+        self.total_pnl = 0.0
+        self._load()
+    
+    def _load(self):
+        """Load account state from file"""
+        if os.path.exists(self.filepath):
+            try:
+                with open(self.filepath, 'r') as f:
+                    data = json.load(f)
+                    self.balance = data.get("balance", self.initial_balance)
+                    self.trades = [PaperTrade(**t) for t in data.get("trades", [])]
+                    self.total_trades = data.get("total_trades", 0)
+                    self.winning_trades = data.get("winning_trades", 0)
+                    self.losing_trades = data.get("losing_trades", 0)
+                    self.total_pnl = data.get("total_pnl", 0.0)
+            except:
+                pass
+    
+    def _save(self):
+        """Save account state to file"""
+        os.makedirs(os.path.dirname(self.filepath), exist_ok=True)
+        with open(self.filepath, 'w') as f:
+            json.dump({
+                "balance": self.balance,
+                "initial_balance": self.initial_balance,
+                "trades": [asdict(t) for t in self.trades],
+                "total_trades": self.total_trades,
+                "winning_trades": self.winning_trades,
+                "losing_trades": self.losing_trades,
+                "total_pnl": self.total_pnl,
+                "last_updated": datetime.now(timezone.utc).isoformat()
+            }, f, indent=2)
+    
+    def place_trade(
+        self,
+        direction: str,
+        market_odds: float,
+        stake_percent: float,
+        prediction_id: str,
+        confidence: float
+    ) -> PaperTrade:
+        """Place a paper trade"""
+        
+        stake = self.balance * stake_percent / 100
+        
+        trade = PaperTrade(
+            trade_id=str(uuid.uuid4())[:8],
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            direction=direction,
+            entry_price=market_odds,
+            market_odds=market_odds,
+            stake=stake,
+            prediction_id=prediction_id,
+            confidence=confidence
+        )
+        
+        self.trades.append(trade)
+        self.total_trades += 1
+        self._save()
+        
+        return trade
+    
+    def resolve_trade(self, trade_id: str, outcome: str, exit_price: float) -> PaperTrade:
+        """Resolve a trade and update balance"""
+        
+        for trade in self.trades:
+            if trade.trade_id == trade_id:
+                trade.exit_price = exit_price
+                trade.outcome = outcome
+                trade.resolved_at = datetime.now(timezone.utc).isoformat()
+                
+                # Calculate P&L
+                if outcome == "WIN":
+                    # Win = get back stake * (1/market_odds)
+                    payout = trade.stake / trade.market_odds
+                    pnl = payout - trade.stake
+                    self.balance += pnl
+                    self.winning_trades += 1
+                else:
+                    # Loss = lose the stake
+                    pnl = -trade.stake
+                    self.balance += pnl
+                    self.losing_trades += 1
+                
+                trade.pnl = pnl
+                self.total_pnl += pnl
+                self._save()
+                
+                return trade
+        
+        return None
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get account statistics"""
+        return {
+            "balance": self.balance,
+            "initial_balance": self.initial_balance,
+            "total_pnl": self.total_pnl,
+            "pnl_percent": (self.balance - self.initial_balance) / self.initial_balance * 100,
+            "total_trades": self.total_trades,
+            "winning_trades": self.winning_trades,
+            "losing_trades": self.losing_trades,
+            "win_rate": self.winning_trades / self.total_trades if self.total_trades > 0 else 0,
+            "open_trades": len([t for t in self.trades if t.outcome is None])
+        }
+
+
+# ============================================================================
+# PREDICTION RECORD
+# ============================================================================
+
 @dataclass
 class PredictionRecord:
     """Complete prediction record for tracking and learning"""
@@ -86,6 +234,10 @@ class PredictionRecord:
     # Signal summary
     regime: str
     confluence: float
+    
+    # Trade info (NEW)
+    trade_id: Optional[str] = None
+    stake: Optional[float] = None
     
     # Outcome (filled after window closes)
     end_price: Optional[float] = None
@@ -154,17 +306,33 @@ class PredictionHistory:
     
     def get_unresolved(self) -> List[PredictionRecord]:
         """Get all predictions that haven't been resolved yet"""
-        return [p for p in self.predictions if p.resolved_at is None and p.window_end <= int(time.time())]
+        now = int(time.time())
+        return [p for p in self.predictions 
+                if p.resolved_at is None and p.window_end <= now]
+    
+    def get_pending(self) -> List[PredictionRecord]:
+        """Get all predictions waiting for resolution"""
+        now = int(time.time())
+        return [p for p in self.predictions 
+                if p.resolved_at is None]
     
     def get_stats(self) -> Dict[str, Any]:
         """Calculate performance statistics"""
         resolved = [p for p in self.predictions if p.resolved_at is not None]
         
+        # Calculate direction stats
+        up_preds = [p for p in resolved if p.predicted_direction == "UP"]
+        down_preds = [p for p in resolved if p.predicted_direction == "DOWN"]
+        neutral_preds = [p for p in resolved if p.predicted_direction == "NEUTRAL"]
+        
         if not resolved:
             return {
                 "total_predictions": len(self.predictions),
                 "resolved": 0,
-                "pending": len(self.predictions)
+                "pending": len(self.predictions),
+                "up_predictions": len(up_preds),
+                "down_predictions": len(down_preds),
+                "neutral_predictions": len(neutral_preds)
             }
         
         correct = sum(1 for p in resolved if p.correct)
@@ -177,9 +345,16 @@ class PredictionHistory:
             "correct": correct,
             "incorrect": len(resolved) - correct,
             "win_rate": correct / len(resolved) if resolved else 0,
-            "average_brier": total_brier / len(resolved) if resolved else 0.25
+            "average_brier": total_brier / len(resolved) if resolved else 0.25,
+            "up_predictions": len(up_preds),
+            "down_predictions": len(down_preds),
+            "neutral_predictions": len(neutral_preds)
         }
 
+
+# ============================================================================
+# ATLAS V4 MAIN CLASS
+# ============================================================================
 
 class AtlasV4:
     """
@@ -192,7 +367,7 @@ class AtlasV4:
     - Multi-timeframe analysis
     - Specialized agent team
     - Risk management
-    - Backtesting
+    - Paper trading account (NEW!)
     """
     
     def __init__(self, llm_client=None):
@@ -230,6 +405,9 @@ class AtlasV4:
         
         # Prediction history
         self.prediction_history = PredictionHistory()
+        
+        # NEW: Paper trading account
+        self.paper_account = PaperTradingAccount()
     
     async def gather_all_data(self) -> Dict[str, Any]:
         """Gather data from all sources"""
@@ -371,11 +549,14 @@ class AtlasV4:
         prediction["final"]["confidence"] = adjusted.adjusted_confidence
         prediction["final"]["should_trade"] = adjusted.should_trade
         
-        # Calculate expected value
-        if self.current_market:
+        # Calculate expected value and position size with market odds
+        market_odds = 0.5
+        if self.current_market and self.current_market.up_price:
+            market_odds = self.current_market.up_price
+            
             ev = self.ev_calculator.calculate_ev(
                 predicted_prob=prediction["final"]["probability"],
-                market_odds=self.current_market.up_price or 0.5,
+                market_odds=market_odds,
                 confidence=adjusted.adjusted_confidence,
                 direction=prediction["final"]["direction"]
             )
@@ -385,17 +566,20 @@ class AtlasV4:
                 "recommendation": ev.recommendation,
                 "is_positive_ev": ev.is_positive_ev
             }
-        
-        # Calculate position size
-        if self.current_market:
+            
+            # Use academic Kelly formula with market odds
             pos_size = self.position_sizer.calculate_size(
                 probability=prediction["final"]["probability"],
-                confidence=adjusted.adjusted_confidence
+                confidence=adjusted.adjusted_confidence,
+                market_odds=market_odds,
+                direction=prediction["final"]["direction"]
             )
             prediction["position_size"] = {
                 "size": pos_size.size,
                 "size_percent": pos_size.size_percent,
-                "kelly_fraction": pos_size.kelly_fraction
+                "kelly_fraction": pos_size.kelly_fraction,
+                "belief_odds": pos_size.belief_odds,
+                "market_odds": pos_size.market_odds
             }
         
         # Add all analysis to prediction
@@ -573,44 +757,55 @@ class AtlasV4:
             
             console.print(tech_table)
     
+    def display_trade_execution(self, prediction: Dict[str, Any], trade: PaperTrade):
+        """Display trade execution details - THIS WAS MISSING!"""
+        
+        final = prediction["final"]
+        direction = final["direction"]
+        
+        # Choose colors based on direction
+        if direction == "UP":
+            dir_color = "green"
+            action = "BUY UP"
+        else:
+            dir_color = "red"
+            action = "BUY DOWN"
+        
+        # Create trade execution panel
+        trade_panel = f"""
+[bold white]━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[/]
+[bold {dir_color}]💰 PAPER TRADE EXECUTED[/]
+[bold white]━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[/]
+
+[bold cyan]Action:[/] [{dir_color}]{action}[/{dir_color}]
+[bold cyan]Entry Price:[/] {trade.market_odds:.2%}
+[bold cyan]Stake:[/] ${trade.stake:.2f} ({trade.stake/self.paper_account.balance*100:.1f}% of balance)
+[bold cyan]Trade ID:[/] {trade.trade_id}
+[bold cyan]Confidence:[/] {trade.confidence:.0%}
+
+[bold cyan]Predicted Direction:[/] [{dir_color}]{direction}[/{dir_color}]
+[bold cyan]Predicted Probability:[/] {final['probability']:.1%}
+[bold white]━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[/]
+
+[bold yellow]Current Account Balance:[/] ${self.paper_account.balance:.2f}
+"""
+        
+        console.print(Panel(
+            trade_panel.strip(),
+            title="[bold]📝 Trade Execution Log[/]",
+            border_style=dir_color
+        ))
+    
     def save_state(self):
         """Save system state"""
         self.agent_team.save_state("data/agent_state.json")
-        self.position_sizer._save_stats() if hasattr(self.position_sizer, '_save_stats') else None
+        self.paper_account._save()
         console.print("[green]State saved successfully[/]")
 
 
-async def run_single_prediction():
-    """Run a single prediction"""
-    console.print("\n[bold cyan]═══════════════════════════════════════════════════════════════[/]")
-    console.print("[bold]  ATLAS v4.0 - Bitcoin 15-Minute Prediction System[/]")
-    console.print("[bold cyan]═══════════════════════════════════════════════════════════════[/]\n")
-    
-    # Initialize LLM
-    try:
-        llm_client = FreeClaudeProxy()
-        console.print("[green]✓ LLM Provider connected[/]")
-    except Exception as e:
-        console.print(f"[yellow]⚠ LLM unavailable: {e}[/]")
-        llm_client = None
-    
-    # Initialize Atlas
-    atlas = AtlasV4(llm_client=llm_client)
-    
-    # Load previous state
-    if atlas.agent_team.load_state("data/agent_state.json"):
-        stats = atlas.agent_team.get_stats()
-        console.print(f"[green]✓ Loaded previous learning[/]")
-    
-    # Make prediction
-    prediction = await atlas.make_prediction()
-    
-    # Display results
-    atlas.display_prediction(prediction)
-    
-    # Save state
-    atlas.save_state()
-
+# ============================================================================
+# DISPLAY FUNCTIONS
+# ============================================================================
 
 def display_market_info(market=None, current_price: float = None):
     """Display market window information"""
@@ -669,18 +864,25 @@ def display_market_info(market=None, current_price: float = None):
     ))
 
 
-def display_performance_stats(history: PredictionHistory):
-    """Display performance statistics"""
-    stats = history.get_stats()
+def display_performance_stats(history: PredictionHistory, account: PaperTradingAccount):
+    """Display performance statistics - FIXED to always show something"""
     
-    if stats["resolved"] == 0:
-        return
+    stats = history.get_stats()
+    account_stats = account.get_stats()
     
     console.print("\n" + "═" * 60)
     console.print("[bold cyan]📊 Performance Statistics[/]")
     console.print("═" * 60)
     
-    perf_table = Table(show_header=True)
+    # Always show account balance
+    balance_color = "green" if account_stats["pnl_percent"] >= 0 else "red"
+    console.print(f"\n[bold yellow]💰 Paper Trading Account[/]")
+    console.print(f"  Balance: ${account_stats['balance']:.2f} (Initial: ${account_stats['initial_balance']:.2f})")
+    console.print(f"  Total P&L: [{balance_color}]{account_stats['total_pnl']:+.2f}[/{balance_color}] ({account_stats['pnl_percent']:+.1f}%)")
+    console.print(f"  Total Trades: {account_stats['total_trades']} (Win: {account_stats['winning_trades']}, Loss: {account_stats['losing_trades']})")
+    
+    # Prediction stats
+    perf_table = Table(show_header=True, title="📈 Prediction Performance")
     perf_table.add_column("Metric", style="cyan", width=25)
     perf_table.add_column("Value", style="white", width=20)
     
@@ -696,16 +898,23 @@ def display_performance_stats(history: PredictionHistory):
         
         brier_color = "green" if stats["average_brier"] < 0.20 else "red" if stats["average_brier"] > 0.25 else "yellow"
         perf_table.add_row("Avg Brier Score", f"[{brier_color}]{stats['average_brier']:.4f}[/{brier_color}]")
+        
+        # Direction distribution
+        perf_table.add_row("UP Predictions", str(stats.get("up_predictions", 0)))
+        perf_table.add_row("DOWN Predictions", str(stats.get("down_predictions", 0)))
+        perf_table.add_row("NEUTRAL Predictions", str(stats.get("neutral_predictions", 0)))
+    else:
+        perf_table.add_row("Status", "[yellow]No resolved predictions yet[/]")
     
     console.print(perf_table)
 
 
-def display_outcome_result(record: PredictionRecord):
+def display_outcome_result(record: PredictionRecord, pnl: float = None):
     """Display the outcome of a resolved prediction"""
     result_color = "green" if record.correct else "red"
     result_emoji = "✅" if record.correct else "❌"
     
-    console.print(f"\n[result_color]{'═' * 60}[/]")
+    console.print(f"\n[{result_color}]{'═' * 60}[/]")
     console.print(f"[bold {result_color}]{result_emoji} MARKET RESOLVED - {'CORRECT!' if record.correct else 'INCORRECT'}[/]")
     console.print(f"[{result_color}]{'═' * 60}[/]")
     
@@ -725,17 +934,28 @@ def display_outcome_result(record: PredictionRecord):
     
     outcome_table.add_row("Brier Score", f"{record.brier_score:.4f}")
     
+    if pnl is not None:
+        pnl_color = "green" if pnl >= 0 else "red"
+        outcome_table.add_row("P&L", f"[{pnl_color}]{pnl:+.2f}[/{pnl_color}]")
+    
     console.print(outcome_table)
 
 
-async def resolve_prediction(atlas: AtlasV4, record: PredictionRecord) -> bool:
+# ============================================================================
+# RESOLUTION FUNCTION
+# ============================================================================
+
+async def resolve_prediction(
+    atlas: AtlasV4, 
+    record: PredictionRecord
+) -> bool:
     """
     Resolve a prediction by fetching the final price and determining outcome.
     
     Returns True if resolution was successful.
     """
     try:
-        console.print(f"\n[cyan]🔄 Resolving prediction {record.prediction_id[:8]}...[/]")
+        console.print(f"\n[cyan]🔄 Resolving prediction {record.prediction_id}...[/]")
         
         # Fetch current price (which is now the end price since window closed)
         async with BinanceClient() as client:
@@ -756,7 +976,6 @@ async def resolve_prediction(atlas: AtlasV4, record: PredictionRecord) -> bool:
             actual_outcome = actual_direction == "UP"
         
         # Determine if prediction was correct
-        # The prediction was correct if the predicted direction matches actual
         if record.predicted_direction == "UP":
             correct = actual_outcome  # UP won
         elif record.predicted_direction == "DOWN":
@@ -765,13 +984,12 @@ async def resolve_prediction(atlas: AtlasV4, record: PredictionRecord) -> bool:
             correct = False  # NEUTRAL predictions are never "correct"
         
         # Calculate Brier score
-        # For UP prediction: (predicted_prob - 1)^2 if UP won, (predicted_prob - 0)^2 if DOWN won
         if actual_outcome:  # UP won
             brier_score = (record.predicted_probability - 1.0) ** 2
         else:  # DOWN won
             brier_score = (record.predicted_probability - 0.0) ** 2
         
-        # Update the record
+        # Update the prediction record
         outcome_data = {
             "end_price": end_price,
             "actual_direction": actual_direction,
@@ -791,6 +1009,17 @@ async def resolve_prediction(atlas: AtlasV4, record: PredictionRecord) -> bool:
             actual_price_change=price_change_percent
         )
         
+        # Resolve paper trade and calculate P&L
+        pnl = None
+        if record.trade_id:
+            trade = atlas.paper_account.resolve_trade(
+                record.trade_id,
+                "WIN" if correct else "LOSS",
+                end_price
+            )
+            if trade:
+                pnl = trade.pnl
+        
         # Update the record for display
         record.end_price = end_price
         record.actual_direction = actual_direction
@@ -801,7 +1030,7 @@ async def resolve_prediction(atlas: AtlasV4, record: PredictionRecord) -> bool:
         record.resolved_at = outcome_data["resolved_at"]
         
         # Display result
-        display_outcome_result(record)
+        display_outcome_result(record, pnl)
         
         return True
         
@@ -809,6 +1038,10 @@ async def resolve_prediction(atlas: AtlasV4, record: PredictionRecord) -> bool:
         console.print(f"[red]Error resolving prediction: {e}[/]")
         return False
 
+
+# ============================================================================
+# PAPER TRADING MODE
+# ============================================================================
 
 async def run_paper_mode(max_predictions: int = None):
     """Run paper trading mode with full outcome tracking and learning"""
@@ -819,7 +1052,6 @@ async def run_paper_mode(max_predictions: int = None):
     # Initialize
     try:
         llm_client = FreeClaudeProxy()
-        console.print("[green]✓ NVIDIA NIM API connected[/]")
         console.print("[green]✓ LLM Provider connected[/]")
     except Exception as e:
         console.print(f"[yellow]⚠ LLM unavailable: {e}[/]")
@@ -832,8 +1064,8 @@ async def run_paper_mode(max_predictions: int = None):
         stats = atlas.agent_team.get_stats()
         console.print(f"[green]✓ Loaded previous learning ({stats['total_predictions']} predictions)[/]")
     
-    # Display existing performance stats
-    display_performance_stats(atlas.prediction_history)
+    # Display existing performance stats (FIXED: always show)
+    display_performance_stats(atlas.prediction_history, atlas.paper_account)
     
     atlas.running = True
     prediction_count = 0
@@ -876,6 +1108,11 @@ async def run_paper_mode(max_predictions: int = None):
         if pending_resolutions:
             console.print(f"[yellow]📋 {len(pending_resolutions)} prediction(s) pending resolution[/]")
         
+        # Show current account balance
+        account_stats = atlas.paper_account.get_stats()
+        balance_color = "green" if account_stats["pnl_percent"] >= 0 else "red"
+        console.print(f"[bold]Current Balance:[/] [{balance_color}]${account_stats['balance']:.2f}[/{balance_color}] ({account_stats['pnl_percent']:+.1f}%)")
+        
         await asyncio.sleep(seconds_until)
         
         # Get current market with PTB
@@ -883,6 +1120,12 @@ async def run_paper_mode(max_predictions: int = None):
         try:
             market = atlas.polymarket.get_current_market(fetch_ptb=True)
             atlas.current_market = market
+            
+            # Log if PTB was fetched
+            if market and market.ptb:
+                console.print(f"[green]✓ PTB fetched: ${market.ptb:,.2f}[/]")
+            else:
+                console.print(f"[yellow]⚠ PTB not available, will use price direction for resolution[/]")
         except Exception as e:
             console.print(f"[yellow]⚠ Could not fetch market: {e}[/]")
             market = None
@@ -895,6 +1138,27 @@ async def run_paper_mode(max_predictions: int = None):
         
         # Create prediction record
         current_price = prediction.get("signals", {}).get("current_price", 0)
+        
+        # Determine if we should trade based on confidence and EV
+        should_trade = prediction["final"].get("should_trade", True)
+        if "ev" in prediction and prediction["ev"]["expected_value"] <= 0:
+            should_trade = False
+            console.print("[yellow]⚠ Skipping trade - negative expected value[/]")
+        
+        # Create trade if we should trade
+        trade = None
+        if should_trade and prediction["final"]["direction"] != "NEUTRAL":
+            stake_percent = 2.0  # Default 2%
+            if "position_size" in prediction:
+                stake_percent = prediction["position_size"]["size_percent"]
+            
+            trade = atlas.paper_account.place_trade(
+                direction=prediction["final"]["direction"],
+                market_odds=prediction["final"]["probability"],
+                stake_percent=stake_percent,
+                prediction_id="pending",  # Will update after record created
+                confidence=prediction["final"]["confidence"]
+            )
         
         record = PredictionRecord(
             prediction_id=str(uuid.uuid4())[:8],
@@ -911,7 +1175,9 @@ async def run_paper_mode(max_predictions: int = None):
             confidence=prediction["final"]["confidence"],
             agent_predictions=prediction["agent_predictions"],
             regime=prediction.get("regime", "Unknown"),
-            confluence=prediction.get("confluence", 0)
+            confluence=prediction.get("confluence", 0),
+            trade_id=trade.trade_id if trade else None,
+            stake=trade.stake if trade else None
         )
         
         # Store prediction in history
@@ -922,7 +1188,8 @@ async def run_paper_mode(max_predictions: int = None):
             "prediction_id": record.prediction_id,
             "timestamp": record.timestamp,
             "final": prediction["final"],
-            "agent_predictions": prediction["agent_predictions"]
+            "agent_predictions": prediction["agent_predictions"],
+            "market_price": prediction["final"]["probability"]
         })
         
         # Display market info with current price
@@ -930,6 +1197,12 @@ async def run_paper_mode(max_predictions: int = None):
         
         # Display prediction
         atlas.display_prediction(prediction)
+        
+        # NEW: Display trade execution if trade was placed
+        if trade:
+            atlas.display_trade_execution(prediction, trade)
+        else:
+            console.print("[yellow]⚠ No trade placed (low confidence or NEUTRAL prediction)[/]")
         
         # Add to pending resolutions
         pending_resolutions.append(record)
@@ -943,7 +1216,7 @@ async def run_paper_mode(max_predictions: int = None):
         prediction_count += 1
         
         # Display updated stats
-        display_performance_stats(atlas.prediction_history)
+        display_performance_stats(atlas.prediction_history, atlas.paper_account)
     
     # Final resolution of any remaining predictions
     console.print("\n[yellow]Resolving remaining predictions...[/]")
@@ -955,7 +1228,39 @@ async def run_paper_mode(max_predictions: int = None):
     atlas.save_state()
     
     # Display final stats
-    display_performance_stats(atlas.prediction_history)
+    display_performance_stats(atlas.prediction_history, atlas.paper_account)
+
+
+async def run_single_prediction():
+    """Run a single prediction"""
+    console.print("\n[bold cyan]═══════════════════════════════════════════════════════════════[/]")
+    console.print("[bold]  ATLAS v4.0 - Bitcoin 15-Minute Prediction System[/]")
+    console.print("[bold cyan]═══════════════════════════════════════════════════════════════[/]\n")
+    
+    # Initialize LLM
+    try:
+        llm_client = FreeClaudeProxy()
+        console.print("[green]✓ LLM Provider connected[/]")
+    except Exception as e:
+        console.print(f"[yellow]⚠ LLM unavailable: {e}[/]")
+        llm_client = None
+    
+    # Initialize Atlas
+    atlas = AtlasV4(llm_client=llm_client)
+    
+    # Load previous state
+    if atlas.agent_team.load_state("data/agent_state.json"):
+        stats = atlas.agent_team.get_stats()
+        console.print(f"[green]✓ Loaded previous learning[/]")
+    
+    # Make prediction
+    prediction = await atlas.make_prediction()
+    
+    # Display results
+    atlas.display_prediction(prediction)
+    
+    # Save state
+    atlas.save_state()
 
 
 async def run_backtest(start_date: str, end_date: str):
@@ -1056,23 +1361,14 @@ def show_status():
         
         console.print(weights_table)
     
-    # Load prediction history
-    history = PredictionHistory()
-    hist_stats = history.get_stats()
+    # Load paper account
+    account = PaperTradingAccount()
+    account_stats = account.get_stats()
     
-    if hist_stats["resolved"] > 0:
-        hist_table = Table(title="📋 Prediction History")
-        hist_table.add_column("Metric", style="cyan")
-        hist_table.add_column("Value", style="yellow")
-        
-        hist_table.add_row("Total Predictions", str(hist_stats["total_predictions"]))
-        hist_table.add_row("Resolved", str(hist_stats["resolved"]))
-        hist_table.add_row("Win Rate", f"{hist_stats['win_rate']:.1%}")
-        hist_table.add_row("Avg Brier Score", f"{hist_stats['average_brier']:.4f}")
-        
-        console.print(hist_table)
-    else:
-        console.print("[yellow]No resolved predictions yet[/]")
+    console.print(f"\n[bold yellow]💰 Paper Trading Account[/]")
+    console.print(f"  Balance: ${account_stats['balance']:.2f}")
+    console.print(f"  P&L: {account_stats['total_pnl']:+.2f} ({account_stats['pnl_percent']:+.1f}%)")
+    console.print(f"  Trades: {account_stats['total_trades']} (W: {account_stats['winning_trades']}, L: {account_stats['losing_trades']})")
 
 
 def main():
